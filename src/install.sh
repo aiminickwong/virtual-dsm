@@ -2,7 +2,6 @@
 set -Eeuo pipefail
 
 : ${URL:=''}    # URL of the PAT file to be downloaded.
-: ${DEV:='Y'}   # Controls whether device nodes are created.
 
 if [ -f "$STORAGE"/dsm.ver ]; then
   BASE=$(cat "$STORAGE/dsm.ver")
@@ -52,19 +51,18 @@ MIN_ROOT=471859200
 MIN_SPACE=6442450944
 FS=$(stat -f -c %T "$STORAGE")
 
-if [[ "$FS" == "overlay"* ]]; then
+if [[ "${FS,,}" == "overlay"* ]]; then
   info "Warning: the filesystem of $STORAGE is OverlayFS, this usually means it was binded to an invalid path!"
 fi
 
-if [[ "$FS" != "fat"* && "$FS" != "vfat"* && "$FS" != "exfat"* && \
-        "$FS" != "ntfs"* && "$FS" != "fuse"* && "$FS" != "msdos"* ]]; then
+if [[ "${FS,,}" != "fat"* && "${FS,,}" != "vfat"* && "${FS,,}" != "exfat"* && \
+        "${FS,,}" != "ntfs"* && "${FS,,}" != "fuse"* && "${FS,,}" != "msdos"* ]]; then
   TMP="$STORAGE/tmp"
 else
   TMP="/tmp/dsm"
   SPACE=$(df --output=avail -B 1 /tmp | tail -n 1)
   if (( MIN_SPACE > SPACE )); then
-    TMP="$STORAGE/tmp"
-    info "Warning: the $FS filesystem of $STORAGE does not support UNIX permissions.."
+    error "The ${FS^^} filesystem of $STORAGE does not support UNIX permissions, and no space left in container!" && exit 93
   fi
 fi
 
@@ -74,15 +72,9 @@ rm -rf "$TMP" && mkdir -p "$TMP"
 SPACE=$(df --output=avail -B 1 / | tail -n 1)
 (( MIN_ROOT > SPACE )) && error "Not enough free space in container root, need at least 450 MB available." && exit 96
 
-SPACE=$(df --output=avail -B 1 "$TMP" | tail -n 1)
+SPACE=$(df --output=avail -B 1 "$STORAGE" | tail -n 1)
 SPACE_GB=$(( (SPACE + 1073741823)/1073741824 ))
-(( MIN_SPACE > SPACE )) && error "Not enough free space for installation in $STORAGE, have $SPACE_GB GB available but need at least 6 GB." && exit 95
-
-if [[ "$TMP" != "$STORAGE/tmp" ]]; then
-  SPACE=$(df --output=avail -B 1 "$STORAGE" | tail -n 1)
-  SPACE_GB=$(( (SPACE + 1073741823)/1073741824 ))
-  (( MIN_SPACE > SPACE )) && error "Not enough free space for installation in $STORAGE, have $SPACE_GB GB available but need at least 6 GB." && exit 94
-fi
+(( MIN_SPACE > SPACE )) && error "Not enough free space for installation in $STORAGE, have $SPACE_GB GB available but need at least 6 GB." && exit 94
 
 # Check if output is to interactive TTY
 if [ -t 1 ]; then
@@ -93,6 +85,7 @@ fi
 
 # Download the required files from the Synology website
 
+ROOT="Y"
 RDC="$STORAGE/dsm.rd"
 
 if [ ! -f "$RDC" ]; then
@@ -132,14 +125,12 @@ if [ -f "$RDC" ]; then
   { xz -dc <"$RDC" >"$TMP/rd" 2>/dev/null; rc=$?; } || :
   (( rc != 1 )) && error "Failed to unxz $RDC, reason $rc" && exit 91
 
-  if [[ "$DEV" == [Nn]* ]]; then
-    # Exclude dev/ from cpio extract
-    { (cd "$TMP" && cpio -it < "$TMP/rd" | grep -Ev 'dev/' | while read -r entry; do cpio -idm "$entry" < "$TMP/rd" 2>/dev/null; done); rc=$?; } || :
+  { (cd "$TMP" && cpio -idm <"$TMP/rd" 2>/dev/null); rc=$?; } || :
+
+  if (( rc != 0 )); then
+    ROOT="N"
+    { (cd "$TMP" && fakeroot cpio -idmu <"$TMP/rd" 2>/dev/null); rc=$?; } || :
     (( rc != 0 )) && error "Failed to extract $RDC, reason $rc" && exit 92
-  else
-    { (cd "$TMP" && cpio -idm <"$TMP/rd" 2>/dev/null); rc=$?; } || :
-    (( rc != 0 )) && error "Failed to extract $RDC, reason $rc"
-    (( rc != 0 )) && error "If the container runs unprivileged, please set DEV=N to exclude device nodes." && exit 92
   fi
 
   mkdir -p /run/extract
@@ -192,14 +183,13 @@ if ((SIZE<250000000)); then
   error "The specified PAT file is probably an update pack as it's too small." && exit 62
 fi
 
+info "Install: Extracting downloaded image..."
+
 if { tar tf "$PAT"; } >/dev/null 2>&1; then
 
-  info "Install: Extracting downloaded image..."
   tar xpf "$PAT" -C "$TMP/."
 
 else
-
-  info "Install: Extracting downloaded image..."
 
   export LD_LIBRARY_PATH="/run/extract"
 
@@ -215,12 +205,7 @@ else
 
 fi
 
-HDA="$TMP/hda1"
-IDB="$TMP/indexdb"
-PKG="$TMP/packages"
-HDP="$TMP/synohdpack_img"
-
-[ ! -f "$HDA.tgz" ] && error "The PAT file contains no OS image." && exit 64
+info "Install: Preparing system partition..."
 
 BOOT=$(find "$TMP" -name "*.bin.zip")
 [ ! -f "$BOOT" ] && error "The PAT file contains no boot image." && exit 67
@@ -230,15 +215,29 @@ unzip -q -o "$BOOT".zip -d "$TMP"
 
 SYSTEM="$TMP/sys.img"
 SYSTEM_SIZE=4954537983
+rm -f "$SYSTEM"
 
 # Check free diskspace
 SPACE=$(df --output=avail -B 1 "$TMP" | tail -n 1)
 SPACE_GB=$(( (SPACE + 1073741823)/1073741824 ))
 (( SYSTEM_SIZE > SPACE )) && error "Not enough free space to create a 4 GB system disk, have only $SPACE_GB GB available." && exit 97
 
+if ! touch "$SYSTEM"; then
+  error "Could not create file $SYSTEM for the system disk." && exit 98
+fi
+  
+if [[ "${FS,,}" == "xfs" || "${FS,,}" == "zfs" || "${FS,,}" == "btrfs" || "${FS,,}" == "bcachefs" ]]; then
+  { chattr +C "$SYSTEM"; } || :
+  FA=$(lsattr "$SYSTEM")
+  if [[ "$FA" != *"C"* ]]; then
+    error "Failed to disable COW for system image $SYSTEM on ${FS^^} filesystem (returned $FA)"
+  fi
+fi
+
 if ! fallocate -l "$SYSTEM_SIZE" "$SYSTEM"; then
   if ! truncate -s "$SYSTEM_SIZE" "$SYSTEM"; then
-    rm -f "$SYSTEM" && error "Could not allocate a file for the system disk." && exit 98
+    rm -f "$SYSTEM"
+    error "Could not allocate file $SYSTEM for the system disk." && exit 98
   fi
 fi
 
@@ -247,7 +246,11 @@ fi
 
 # Check the filesize
 SIZE=$(stat -c%s "$SYSTEM")
-[[ SIZE -ne SYSTEM_SIZE ]] && rm -f "$SYSTEM" && error "System disk has the wrong size: $SIZE" && exit 90
+
+if [[ SIZE -ne SYSTEM_SIZE ]]; then
+  rm -f "$SYSTEM"
+  error "System disk has the wrong size: $SIZE vs $SYSTEM_SIZE" && exit 90
+fi
 
 PART="$TMP/partition.fdisk"
 
@@ -263,33 +266,55 @@ PART="$TMP/partition.fdisk"
 
 sfdisk -q "$SYSTEM" < "$PART"
 
-info "Install: Extracting system partition..."
-
 MOUNT="$TMP/system"
 rm -rf "$MOUNT" && mkdir -p "$MOUNT"
 
+info "Install: Extracting system partition..."
+
+HDA="$TMP/hda1"
+IDB="$TMP/indexdb"
+PKG="$TMP/packages"
+HDP="$TMP/synohdpack_img"
+
+[ ! -f "$HDA.tgz" ] && error "The PAT file contains no OS image." && exit 64
+
 mv "$HDA.tgz" "$HDA.txz"
 
-if [[ "$DEV" == [Nn]* ]]; then
-  # Exclude dev/ from tar extract
-  tar xpfJ "$HDA.txz" --absolute-names --exclude="dev" -C "$MOUNT/"
-else
+if [[ "$ROOT" != [Nn]* ]]; then
+
   tar xpfJ "$HDA.txz" --absolute-names -C "$MOUNT/"
+
 fi
 
 [ -d "$PKG" ] && mv "$PKG/" "$MOUNT/.SynoUpgradePackages/"
 rm -f "$MOUNT/.SynoUpgradePackages/ActiveInsight-"*
 
 [ -f "$HDP.txz" ] && tar xpfJ "$HDP.txz" --absolute-names -C "$MOUNT/"
-[ -f "$IDB.txz" ] && tar xpfJ "$IDB.txz" --absolute-names -C "$MOUNT/usr/syno/synoman/indexdb/"
 
-info "Install: Installing system partition..."
+if [ -f "$IDB.txz" ]; then
+  INDEX_DB="$MOUNT/usr/syno/synoman/indexdb/"
+  mkdir -p "$INDEX_DB"
+  tar xpfJ "$IDB.txz" --absolute-names -C "$INDEX_DB"
+fi
 
 LABEL="1.44.1-42218"
 OFFSET="1048576" # 2048 * 512
 NUMBLOCKS="622560" # (4980480 * 512) / 4096
 
-mke2fs -q -t ext4 -b 4096 -d "$MOUNT/" -L "$LABEL" -F -E "offset=$OFFSET" "$SYSTEM" "$NUMBLOCKS"
+if [[ "$ROOT" != [Nn]* ]]; then
+
+  info "Install: Installing system partition..."
+
+  mke2fs -q -t ext4 -b 4096 -d "$MOUNT/" -L "$LABEL" -F -E "offset=$OFFSET" "$SYSTEM" "$NUMBLOCKS"
+
+else
+
+  fakeroot -- bash -c "set -Eeu;\
+        tar xpfJ $HDA.txz --absolute-names --skip-old-files -C $MOUNT/;\
+        printf '%b%s%b' '\E[1;34m❯ \E[1;36m' 'Install: Installing system partition...' '\E[0m\n';\
+        mke2fs -q -t ext4 -b 4096 -d $MOUNT/ -L $LABEL -F -E offset=$OFFSET $SYSTEM $NUMBLOCKS"
+
+fi
 
 rm -rf "$MOUNT"
 

@@ -11,8 +11,7 @@ trap 'error "Status $? while: $BASH_COMMAND (line $LINENO/$BASH_LINENO)"' ERR
 
 # Docker environment variables
 
-: ${GPU:='N'}           # Disable GPU passthrough
-: ${KVM:='Y'}           # Enable KVM acceleration
+: ${TZ:=''}             # System local timezone
 : ${DEBUG:='N'}         # Disable debugging mode
 : ${COUNTRY:=''}        # Country code for mirror
 : ${CONSOLE:='N'}       # Disable console mode
@@ -37,8 +36,10 @@ STORAGE="/storage"
 # Cleanup files
 
 rm -f /run/dsm.url
+rm -f /run/qemu.ip
+rm -f /run/qemu.log
 rm -f /run/qemu.pid
-rm -f /run/qemu.count
+rm -f /run/qemu.end
 
 # Cleanup dirs
 
@@ -48,8 +49,41 @@ rm -rf "$STORAGE/tmp"
 
 # Helper functions
 
-getCountry () {
+isAlive() {
+  local pid=$1
 
+  if kill -0 "$pid" 2>/dev/null; then
+    return 0
+  fi
+
+  return 1
+}
+
+pKill() {
+  local pid=$1
+
+  { kill -15 "$pid" || true; } 2>/dev/null
+
+  while isAlive "$pid"; do
+    sleep 0.1
+  done
+
+  return 0
+}
+
+fKill() {
+  local name=$1
+
+  { pkill -f "$name" || true; } 2>/dev/null
+
+  while pgrep -f -l "$name" >/dev/null; do
+    sleep 0.1
+  done
+
+  return 0
+}
+
+getCountry() {
   local url=$1
   local query=$2
   local rc json result
@@ -68,7 +102,14 @@ getCountry () {
   return 0
 }
 
-setCountry () {
+setCountry() {
+
+  [[ "${TZ,,}" == "asia/harbin" ]] && COUNTRY="CN"
+  [[ "${TZ,,}" == "asia/beijing" ]] && COUNTRY="CN"
+  [[ "${TZ,,}" == "asia/urumqi" ]] && COUNTRY="CN"
+  [[ "${TZ,,}" == "asia/kashgar" ]] && COUNTRY="CN"
+  [[ "${TZ,,}" == "asia/shanghai" ]] && COUNTRY="CN"
+  [[ "${TZ,,}" == "asia/chongqing" ]] && COUNTRY="CN"
 
   [ -z "$COUNTRY" ] && getCountry "https://api.ipapi.is" ".location.country_code"
   [ -z "$COUNTRY" ] && getCountry "https://ifconfig.co/json" ".country_iso"
@@ -78,8 +119,7 @@ setCountry () {
   return 0
 }
 
-addPackage () {
-
+addPackage() {
   local pkg=$1
   local desc=$2
 
